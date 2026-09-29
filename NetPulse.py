@@ -4,12 +4,14 @@ import subprocess
 import datetime
 import os
 import sys
+import json
 from urllib.parse import urlparse
 
 
 APP_NAME = "NetPulse"
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 report_logs = []
+report_events = []
 
 USE_COLOR = sys.stdout.isatty()
 
@@ -28,8 +30,10 @@ BLUE = "94"
 BOLD = "1"
 
 
-def add_to_report(title, content):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def add_to_report(title, content, status="observed"):
+    timestamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    report_events.append({"timestamp": timestamp, "check": title,
+                          "status": status, "output": content})
     report_logs.append(
         f"\n[{timestamp}] {title}\n"
         f"{'-' * 45}\n"
@@ -103,19 +107,19 @@ def run_command(command, title, timeout=90):
             output = "No output returned."
 
         print(output)
-        add_to_report(title, output)
+        add_to_report(title, output, "completed" if result.returncode == 0 else "nonzero_exit")
         return output
 
     except subprocess.TimeoutExpired:
         message = "Command timed out. Try another host or check your connection."
         print(color(message, RED))
-        add_to_report(title, message)
+        add_to_report(title, message, "timeout")
         return message
 
     except FileNotFoundError:
         message = "Command not found on this system."
         print(color(message, RED))
-        add_to_report(title, message)
+        add_to_report(title, message, "unavailable")
         return message
 
 
@@ -174,6 +178,23 @@ def traceroute():
     run_command(command, f"Traceroute - {host}", timeout=120)
 
 
+def tcp_probe(host, port, timeout=5):
+    """Check one TCP endpoint; report evidence without guessing a root cause."""
+    if not host or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return "invalid_input", "Use a host and an integer port between 1 and 65535."
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return "connected", f"TCP connection to {host}:{port} succeeded. Application health was not tested."
+    except socket.gaierror:
+        return "dns_error", f"Name resolution failed for {host}. No TCP connection result is available."
+    except ConnectionRefusedError:
+        return "refused", f"TCP connection to {host}:{port} was refused. Verify the listener and filtering policy."
+    except (socket.timeout, TimeoutError):
+        return "timeout", f"TCP connection to {host}:{port} timed out. This does not establish that the port is closed."
+    except OSError as error:
+        return "network_error", f"TCP connection to {host}:{port} failed (errno={error.errno}). Cause needs further investigation."
+
+
 def port_check():
     host = normalize_host(input("Enter website or IP: "))
     port_input = input("Enter port number: ").strip()
@@ -185,23 +206,14 @@ def port_check():
     try:
         port = int(port_input)
 
-        if port < 1 or port > 65535:
-            output = "Invalid port number. Use a number between 1 and 65535."
-        else:
-            with socket.create_connection((host, port), timeout=5):
-                output = f"Port {port} on {host} is OPEN."
+        status, output = tcp_probe(host, port)
 
     except ValueError:
+        status = "invalid_input"
         output = "Invalid port number."
 
-    except socket.timeout:
-        output = f"Port {port_input} on {host} timed out."
-
-    except OSError:
-        output = f"Port {port_input} on {host} is CLOSED or unreachable."
-
-    print(color(output, GREEN if "OPEN" in output else RED))
-    add_to_report(f"Port Check - {host}:{port_input}", output)
+    print(color(output, GREEN if status == "connected" else RED))
+    add_to_report(f"Port Check - {host}:{port_input}", output, status)
 
 
 def get_local_ip():
@@ -259,14 +271,24 @@ def quick_health_check():
 
     run_command(command, "Quick Health Check - Ping 1.1.1.1", timeout=30)
 
-    try:
-        with socket.create_connection((port_target, port_number), timeout=5):
-            port_output = f"Port OK: {port_number} on {port_target} is OPEN."
-    except OSError:
-        port_output = f"Port FAILED: {port_number} on {port_target} is not reachable."
+    port_status, port_output = tcp_probe(port_target, port_number)
+    print(color(port_output, GREEN if port_status == "connected" else RED))
+    add_to_report("Quick Health Check - Port 443", port_output, port_status)
 
-    print(color(port_output, GREEN if "OK" in port_output else RED))
-    add_to_report("Quick Health Check - Port 443", port_output)
+
+def export_reports(stem):
+    """Write a readable report and a structured copy for later comparison."""
+    text_path = f"{stem}.txt"
+    json_path = f"{stem}.json"
+    with open(text_path, "w", encoding="utf-8") as file:
+        file.write(f"NETPULSE {APP_VERSION} - NETWORK DIAGNOSTIC REPORT\n")
+        file.write("Evidence from individual checks; not a root-cause diagnosis.\n")
+        file.write("\n".join(report_logs))
+    with open(json_path, "w", encoding="utf-8") as file:
+        json.dump({"schema_version": 1, "tool": APP_NAME, "version": APP_VERSION,
+                   "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                   "checks": report_events}, file, ensure_ascii=False, indent=2)
+    return text_path, json_path
 
 
 def save_report():
@@ -274,16 +296,11 @@ def save_report():
         print(color("No report data to save yet. Run some tools first.", YELLOW))
         return
 
-    filename = f"netpulse_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    stem = f"netpulse_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
     try:
-        with open(filename, "w", encoding="utf-8") as file:
-            file.write("=" * 55 + "\n")
-            file.write("NETPULSE v1.0 - NETWORK DIAGNOSTIC REPORT\n")
-            file.write("=" * 55 + "\n")
-            file.write("\n".join(report_logs))
-
-        print(color(f"Report saved successfully: {filename}", GREEN))
+        text_path, json_path = export_reports(stem)
+        print(color(f"Reports saved: {text_path} and {json_path}", GREEN))
 
     except OSError as error:
         print(color(f"Failed to save report: {error}", RED))

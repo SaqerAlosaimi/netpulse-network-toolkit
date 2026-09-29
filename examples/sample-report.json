@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "tool": "NetPulse",
+  "version": "v1.1",
+  "generated_at": "2026-09-30T09:00:00+03:00",
+  "checks": [
+    {
+      "timestamp": "2026-09-30T08:59:55+03:00",
+      "check": "Port Check - service.example:443",
+      "status": "timeout",
+      "output": "TCP connection to service.example:443 timed out. This does not establish that the port is closed."
+    }
+  ]
+}
